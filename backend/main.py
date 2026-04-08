@@ -13,6 +13,7 @@ class ValidateKeyRequest(BaseModel):
 class ScrapeRequest(BaseModel):
     url: str
     api_key: str
+    raw_text: str = ""  # fallback: user can paste job text directly
 
 class TailorRequest(BaseModel):
     latex_content: str
@@ -25,8 +26,10 @@ class CompileRequest(BaseModel):
 
 async def call_gemma(api_key: str, prompt: str, max_tokens: int = 8192) -> str:
     endpoint = f"{GEMMA_URL}?key={api_key}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": max_tokens}
+    }
     async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(endpoint, json=payload, headers={"Content-Type": "application/json"})
     if resp.status_code != 200:
@@ -39,6 +42,59 @@ async def call_gemma(api_key: str, prompt: str, max_tokens: int = 8192) -> str:
 
 def strip_fences(text: str) -> str:
     return re.sub(r"```(?:json|latex|tex)?|```", "", text).strip()
+
+def html_to_text(html: str) -> str:
+    """Strip HTML tags and clean whitespace."""
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text)
+    text = re.sub(r"&gt;", ">", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+def extract_json(text: str) -> dict:
+    """Try multiple strategies to extract JSON from Gemma response."""
+    cleaned = strip_fences(text)
+    # Strategy 1: direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # Strategy 2: find first { ... } block
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # Strategy 3: extract key-value pairs manually as fallback
+    raise ValueError(f"Could not extract JSON. Raw response: {cleaned[:500]}")
+
+LINKEDIN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+def convert_linkedin_url(url: str) -> list[str]:
+    """Convert LinkedIn job URL to multiple formats to try."""
+    urls_to_try = [url]
+    # Extract job ID
+    m = re.search(r"/jobs/view/(\d+)", url)
+    if m:
+        job_id = m.group(1)
+        # Public-facing formats that don't require login
+        urls_to_try += [
+            f"https://www.linkedin.com/jobs/view/{job_id}/",
+            f"https://linkedin.com/jobs/view/{job_id}/",
+        ]
+    return urls_to_try
 
 @app.post("/api/validate-key")
 async def validate_key(req: ValidateKeyRequest):
@@ -54,36 +110,91 @@ async def validate_key(req: ValidateKeyRequest):
 
 @app.post("/api/scrape-job")
 async def scrape_job(req: ScrapeRequest):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        try:
-            r = await client.get(req.url, headers=headers)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not fetch URL: {e}")
-        if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"URL returned HTTP {r.status_code}")
-    html = r.text
-    clean = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL|re.IGNORECASE)
-    clean = re.sub(r"<style[^>]*>.*?</style>", " ", clean, flags=re.DOTALL|re.IGNORECASE)
-    clean = re.sub(r"<[^>]+>", " ", clean)
-    text = re.sub(r"\s{2,}", " ", clean).strip()[:7000]
+    text = ""
 
-    prompt = f"""Analyze this job posting and return ONLY a valid JSON object (no markdown, no explanation).
-Keys required:
-{{"job_title":"","company":"","location":"","employment_type":"","salary_range":"","sponsorship":"Yes|No|Not mentioned","sponsorship_details":"","summary":"","basic_qualifications":[],"preferred_qualifications":[],"key_skills":[],"responsibilities":[]}}
+    # If user pasted raw text directly, use that
+    if req.raw_text and len(req.raw_text.strip()) > 100:
+        text = req.raw_text.strip()[:8000]
+    else:
+        # Try scraping the URL
+        url = req.url.strip()
+        is_linkedin = "linkedin.com" in url
 
-Job posting:
-{text}"""
+        urls_to_try = convert_linkedin_url(url) if is_linkedin else [url]
+        last_error = ""
+        raw_html = ""
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for try_url in urls_to_try:
+                try:
+                    r = await client.get(try_url, headers=LINKEDIN_HEADERS)
+                    if r.status_code == 200:
+                        raw_html = r.text
+                        break
+                    else:
+                        last_error = f"HTTP {r.status_code}"
+                except Exception as e:
+                    last_error = str(e)
+
+        if not raw_html:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not fetch the job URL ({last_error}). "
+                       f"{'LinkedIn requires login for this posting. Please paste the job description text directly into the text box instead.' if is_linkedin else 'Please check the URL or paste the job description text directly.'}"
+            )
+
+        text = html_to_text(raw_html)
+
+        # Check if we got blocked (LinkedIn login wall)
+        if is_linkedin and any(phrase in text.lower() for phrase in [
+            "join now", "sign in", "authwall", "join linkedin", "be the first to see"
+        ]):
+            raise HTTPException(
+                status_code=403,
+                detail="LinkedIn is blocking automated access to this job posting. "
+                       "Please copy the full job description text from LinkedIn and paste it directly into the text box instead of the URL."
+            )
+
+        if len(text) < 200:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract enough text from this URL. Please paste the job description text directly."
+            )
+
+        text = text[:8000]
+
+    # Now parse with Gemma
+    prompt = f"""You are a job posting analyzer. Extract structured information and return ONLY a valid JSON object.
+No markdown fences, no explanation — raw JSON only.
+
+Return exactly this structure:
+{{
+  "job_title": "string",
+  "company": "string",
+  "location": "string",
+  "employment_type": "Full-time | Part-time | Contract | Internship | Other",
+  "salary_range": "string or Not mentioned",
+  "sponsorship": "Yes | No | Not mentioned",
+  "sponsorship_details": "brief explanation of sponsorship status",
+  "summary": "2-3 sentence description of the role",
+  "basic_qualifications": ["list of must-have requirements"],
+  "preferred_qualifications": ["list of nice-to-have requirements"],
+  "key_skills": ["list of technical and soft skills"],
+  "responsibilities": ["list of key job duties"]
+}}
+
+Job posting text:
+{text}
+
+Return ONLY the JSON object:"""
+
     raw = await call_gemma(req.api_key, prompt, max_tokens=2048)
-    cleaned = strip_fences(raw)
+
     try:
-        job_info = json.loads(cleaned)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if m:
-            job_info = json.loads(m.group())
-        else:
-            raise HTTPException(status_code=500, detail=f"Could not parse job JSON: {cleaned[:300]}")
+        job_info = extract_json(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {"job_info": job_info}
 
 @app.post("/api/tailor-resume")
